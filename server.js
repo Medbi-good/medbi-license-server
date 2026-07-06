@@ -163,7 +163,7 @@ app.post('/api/store/free-activate', async (req, res) => {
       [license, promoCode, appId, deviceId, durationDays]
     );
 
-    res.json({ license, promoSlot: claim.rows[0].promo_used });
+    res.json({ license, durationDays, promoSlot: claim.rows[0].promo_used });
   } catch (err) {
     console.error('free-activate error:', err);
     res.status(500).json({ error: 'server_error' });
