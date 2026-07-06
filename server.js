@@ -120,17 +120,131 @@ app.post('/api/activate', async (req, res) => {
   }
 });
 
+// Promoción "primeros 50 gratis" — activa 1 mes gratis automáticamente,
+// sin código, mientras queden cupos (apps.promo_limit / promo_used).
+// Después del cupo 50, el dispositivo debe activar con código pago normal.
+app.post('/api/store/free-activate', async (req, res) => {
+  const { appId, deviceId } = req.body || {};
+  if (!appId || !deviceId) return res.status(400).json({ error: 'missing_fields' });
+
+  try {
+    // Si este dispositivo ya tiene una licencia (gratis o paga), se la devolvemos
+    // en vez de reclamar otro cupo de la promo.
+    const existing = await pool.query(
+      'SELECT license FROM licenses WHERE app_id = $1 AND device_id = $2 LIMIT 1',
+      [appId, deviceId]
+    );
+    if (existing.rows.length > 0) {
+      return res.json({ license: existing.rows[0].license, alreadyActivated: true });
+    }
+
+    // Reclama un cupo de forma atómica (evita que dos dispositivos tomen el mismo cupo a la vez)
+    const claim = await pool.query(
+      `UPDATE apps SET promo_used = COALESCE(promo_used, 0) + 1
+       WHERE id = $1 AND promo_limit IS NOT NULL AND COALESCE(promo_used, 0) < promo_limit
+       RETURNING promo_used, promo_duration_days`,
+      [appId]
+    );
+    if (claim.rows.length === 0) {
+      return res.status(409).json({ error: 'promo_ended' });
+    }
+
+    const durationDays = claim.rows[0].promo_duration_days || 30;
+    const promoCode = 'PROMO' + generateCode(6);
+
+    await pool.query(
+      'INSERT INTO codes (code, app_id, duration_days, used, device_id, activated_at) VALUES ($1, $2, $3, true, $4, now())',
+      [promoCode, appId, durationDays, deviceId]
+    );
+
+    const license = generateLicense();
+    await pool.query(
+      "INSERT INTO licenses (license, code, app_id, device_id, expires_at) VALUES ($1, $2, $3, $4, now() + ($5 || ' days')::interval)",
+      [license, promoCode, appId, deviceId, durationDays]
+    );
+
+    res.json({ license, promoSlot: claim.rows[0].promo_used });
+  } catch (err) {
+    console.error('free-activate error:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Consulta cuántos cupos de la promo quedan (para mostrar en MEDBI Store, opcional)
+app.get('/api/store/promo-status', async (req, res) => {
+  const { appId } = req.query;
+  if (!appId) return res.status(400).json({ error: 'missing_appId' });
+
+  try {
+    const { rows } = await pool.query(
+      'SELECT promo_limit, promo_used FROM apps WHERE id = $1',
+      [appId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'unknown_app' });
+
+    const { promo_limit, promo_used } = rows[0];
+    if (!promo_limit) return res.json({ active: false });
+
+    const used = promo_used || 0;
+    res.json({
+      active: used < promo_limit,
+      remaining: Math.max(promo_limit - used, 0),
+      limit: promo_limit
+    });
+  } catch (err) {
+    console.error('promo-status error:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 // Valida que una licencia siga perteneciendo a ese dispositivo + app
+// Además avisa si está por vencer: 7 días antes si es plan anual, 3 días si es mensual
 app.post('/api/validate', async (req, res) => {
   const { deviceId, appId, license } = req.body || {};
   if (!deviceId || !appId || !license) return res.json({ valid: false });
 
   try {
     const { rows } = await pool.query(
-      'SELECT 1 FROM licenses WHERE license = $1 AND app_id = $2 AND device_id = $3 AND (expires_at IS NULL OR expires_at > now())',
+      `SELECT l.expires_at, c.duration_days
+       FROM licenses l
+       JOIN codes c ON c.code = l.code
+       WHERE l.license = $1 AND l.app_id = $2 AND l.device_id = $3
+         AND (l.expires_at IS NULL OR l.expires_at > now())`,
       [license, appId, deviceId]
     );
-    res.json({ valid: rows.length > 0 });
+
+    if (rows.length === 0) {
+      return res.json({ valid: false });
+    }
+
+    const { expires_at, duration_days } = rows[0];
+    let daysRemaining = null;
+    let warning = false;
+    let message = null;
+
+    if (expires_at) {
+      const msRemaining = new Date(expires_at).getTime() - Date.now();
+      daysRemaining = Math.ceil(msRemaining / (1000 * 60 * 60 * 24));
+
+      // Plan anual (>=300 días) avisa con 7 días de antecedência; mensual con 3 días
+      const isAnnual = duration_days >= 300;
+      const threshold = isAnnual ? 7 : 3;
+
+      if (daysRemaining <= threshold) {
+        warning = true;
+        message = daysRemaining <= 0
+          ? 'Sua licença vence hoje.'
+          : `Sua licença vence em ${daysRemaining} dia${daysRemaining === 1 ? '' : 's'}. Renove para continuar usando o app.`;
+      }
+    }
+
+    res.json({
+      valid: true,
+      expiresAt: expires_at,
+      daysRemaining,
+      warning,
+      message
+    });
   } catch (err) {
     console.error('validate error:', err);
     res.json({ valid: false });
