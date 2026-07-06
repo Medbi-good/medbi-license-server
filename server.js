@@ -158,7 +158,7 @@ app.get('/admin', (_req, res) => {
   <h1>MEDBI — Generar código de activación</h1>
   <input type="password" id="adminKey" placeholder="Tu clave de administrador">
   <select id="appId">
-    <option value="guia-guardia">Guia de Guardia</option>
+    <option value="guia-guardia">MEDBI Medicina Interna</option>
   </select>
   <select id="plan">
     <option value="monthly">Mensal — 250 FCFA (30 dias)</option>
