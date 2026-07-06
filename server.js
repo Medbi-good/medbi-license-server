@@ -13,7 +13,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin 0/O/1/I para evitar confusiones
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 function generateCode(length = 8) {
   let out = '';
@@ -32,11 +32,10 @@ app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'medbi-license-server' });
 });
 
-// Catálogo de apps para MEDBI Store
 app.get('/api/store/apps', async (_req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT id, name, description, icon, version, size_mb FROM apps WHERE published = true ORDER BY name'
+      'SELECT id, name, description, icon, version, size_mb, apk_url FROM apps WHERE published = true ORDER BY name'
     );
     res.json({ apps: rows });
   } catch (err) {
@@ -45,7 +44,6 @@ app.get('/api/store/apps', async (_req, res) => {
   }
 });
 
-// Genera un código de activación de un solo uso para una app
 app.post('/api/store/generate-code', async (req, res) => {
   const { appId } = req.body || {};
   if (!appId) return res.status(400).json({ error: 'missing_appId' });
@@ -74,7 +72,6 @@ app.post('/api/store/generate-code', async (req, res) => {
   }
 });
 
-// Consume un código y ata la licencia a un dispositivo
 app.post('/api/activate', async (req, res) => {
   const { code, deviceId, appId } = req.body || {};
   if (!code || !deviceId || !appId) return res.status(400).json({ error: 'missing_fields' });
@@ -108,7 +105,6 @@ app.post('/api/activate', async (req, res) => {
   }
 });
 
-// Valida que una licencia siga perteneciendo a ese dispositivo + app
 app.post('/api/validate', async (req, res) => {
   const { deviceId, appId, license } = req.body || {};
   if (!deviceId || !appId || !license) return res.json({ valid: false });
