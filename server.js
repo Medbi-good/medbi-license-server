@@ -36,7 +36,7 @@ app.get('/', (_req, res) => {
 app.get('/api/store/apps', async (_req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT id, name, description, icon, version, size_mb, apk_url FROM apps WHERE published = true ORDER BY name'
+      'SELECT id, name, description, icon, version, size_mb, apk_url, is_free FROM apps WHERE published = true ORDER BY name'
     );
     res.json({ apps: rows });
   } catch (err) {
