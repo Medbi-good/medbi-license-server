@@ -75,18 +75,75 @@ async function ghApi(path, opts, token) {
   return res;
 }
 
-async function uploadFileToRepo(owner, repoName, token, path, base64content, commitMessage) {
-  let sha;
-  const existing = await ghApi(`/repos/${owner}/${repoName}/contents/${path}`, {}, token);
-  if (existing.ok) {
-    const j = await existing.json();
-    sha = j.sha;
+async function getBranchHeadCommit(owner, repoName, token, branch) {
+  const refRes = await ghApi(`/repos/${owner}/${repoName}/git/ref/heads/${branch}`, {}, token);
+  if (!refRes.ok) {
+    const err = await refRes.json().catch(() => ({}));
+    throw new Error(`não consegui obter o branch "${branch}": ${err.message || refRes.status}`);
   }
-  return ghApi(
-    `/repos/${owner}/${repoName}/contents/${path}`,
-    { method: 'PUT', body: JSON.stringify({ message: commitMessage, content: base64content, sha }) },
+  const refJson = await refRes.json();
+  return refJson.object.sha;
+}
+
+// Envia TODOS os ficheiros (www/ + ícone) num único commit via Git Data API,
+// em vez de 1 GET (sha existente) + 1 PUT por ficheiro via Contents API.
+// Os blobs são criados em paralelo — isto é o que mais reduz o tempo de
+// build quando há várias dezenas de ficheiros (ex: modo ZIP), porque troca
+// N pedidos sequenciais por um pequeno número de pedidos, a maioria em paralelo.
+async function commitFilesToRepo(owner, repoName, token, branch, files, commitMessage) {
+  const headSha = await getBranchHeadCommit(owner, repoName, token, branch);
+
+  const baseCommitRes = await ghApi(`/repos/${owner}/${repoName}/git/commits/${headSha}`, {}, token);
+  if (!baseCommitRes.ok) throw new Error('não consegui ler o commit base.');
+  const baseCommitJson = await baseCommitRes.json();
+  const baseTreeSha = baseCommitJson.tree.sha;
+
+  const treeEntries = await Promise.all(files.map(async (f) => {
+    const blobRes = await ghApi(
+      `/repos/${owner}/${repoName}/git/blobs`,
+      { method: 'POST', body: JSON.stringify({ content: f.base64, encoding: 'base64' }) },
+      token
+    );
+    if (!blobRes.ok) {
+      const err = await blobRes.json().catch(() => ({}));
+      throw new Error(`falha ao criar blob para ${f.path}: ${err.message || blobRes.status}`);
+    }
+    const blobJson = await blobRes.json();
+    return { path: f.path, mode: '100644', type: 'blob', sha: blobJson.sha };
+  }));
+
+  const treeRes = await ghApi(
+    `/repos/${owner}/${repoName}/git/trees`,
+    { method: 'POST', body: JSON.stringify({ base_tree: baseTreeSha, tree: treeEntries }) },
     token
   );
+  if (!treeRes.ok) {
+    const err = await treeRes.json().catch(() => ({}));
+    throw new Error('falha ao criar a árvore git: ' + (err.message || treeRes.status));
+  }
+  const treeJson = await treeRes.json();
+
+  const commitRes = await ghApi(
+    `/repos/${owner}/${repoName}/git/commits`,
+    { method: 'POST', body: JSON.stringify({ message: commitMessage, tree: treeJson.sha, parents: [headSha] }) },
+    token
+  );
+  if (!commitRes.ok) {
+    const err = await commitRes.json().catch(() => ({}));
+    throw new Error('falha ao criar o commit: ' + (err.message || commitRes.status));
+  }
+  const commitJson = await commitRes.json();
+
+  const updateRefRes = await ghApi(
+    `/repos/${owner}/${repoName}/git/refs/heads/${branch}`,
+    { method: 'PATCH', body: JSON.stringify({ sha: commitJson.sha }) },
+    token
+  );
+  if (!updateRefRes.ok) {
+    const err = await updateRefRes.json().catch(() => ({}));
+    throw new Error(`falha ao atualizar o branch "${branch}": ` + (err.message || updateRefRes.status));
+  }
+  return commitJson.sha;
 }
 
 function sleep(ms) {
@@ -105,6 +162,7 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
     }
     log(job, 'repositório encontrado.', 'ok');
 
+    const filesToCommit = [];
     if (mode === 'url') {
       // Modo "vivo": não embutimos nada. O www/ local fica só com um placeholder
       // mínimo (o build-apk.yml deve gerar capacitor.config.json com
@@ -112,43 +170,26 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
       // sem isto o Capacitor falha por não encontrar pasta www/).
       log(job, `modo URL — a app vai apontar para ${liveUrl}, sem embutir ficheiros.`, 'dim');
       const placeholder = '<!doctype html><html><body>A carregar…</body></html>';
-      const put = await uploadFileToRepo(
-        owner, repoName, token, 'www/index.html',
-        Buffer.from(placeholder, 'utf8').toString('base64'),
-        'build: placeholder www/ (modo url) via apk-builder'
-      );
-      if (!put.ok) {
-        const err = await put.json().catch(() => ({}));
-        log(job, `falha ao enviar placeholder www/index.html: ${err.message || put.status}`, 'err');
-        job.status = 'error';
-        return;
-      }
-      log(job, '✓ placeholder www/index.html enviado.', 'ok');
+      filesToCommit.push({ path: 'www/index.html', base64: Buffer.from(placeholder, 'utf8').toString('base64') });
     } else {
-      log(job, `a enviar ${files.length} ficheiro(s) para www/...`, 'dim');
-      for (const f of files) {
-        const put = await uploadFileToRepo(owner, repoName, token, f.path, f.base64, 'build: atualizar ' + f.path + ' via apk-builder');
-        if (!put.ok) {
-          const err = await put.json().catch(() => ({}));
-          log(job, `falha ao enviar ${f.path}: ${err.message || put.status}`, 'err');
-          job.status = 'error';
-          return;
-        }
-        log(job, `✓ ${f.path}`, 'dim');
-      }
-      log(job, 'todos os ficheiros enviados.', 'ok');
+      log(job, `a preparar ${files.length} ficheiro(s) para www/...`, 'dim');
+      filesToCommit.push(...files);
+    }
+    if (iconBase64) {
+      filesToCommit.push({ path: 'resources/icon.png', base64: iconBase64 });
     }
 
-    if (iconBase64) {
-      log(job, 'a enviar ícone...', 'dim');
-      const iconPut = await uploadFileToRepo(owner, repoName, token, 'resources/icon.png', iconBase64, 'build: atualizar ícone via apk-builder');
-      if (!iconPut.ok) {
-        const err = await iconPut.json().catch(() => ({}));
-        log(job, `falha ao enviar ícone: ${err.message || iconPut.status}`, 'err');
-        job.status = 'error';
-        return;
-      }
-      log(job, 'ícone enviado.', 'ok');
+    log(job, `a enviar ${filesToCommit.length} ficheiro(s) num único commit...`, 'dim');
+    try {
+      const commitSha = await commitFilesToRepo(
+        owner, repoName, token, 'main', filesToCommit,
+        'build: atualizar conteúdo via apk-builder'
+      );
+      log(job, `✓ commit único enviado (${commitSha.slice(0, 7)}).`, 'ok');
+    } catch (e) {
+      log(job, e.message || String(e), 'err');
+      job.status = 'error';
+      return;
     }
 
     log(job, `a disparar workflow build-apk.yml (formato: ${outputFormat.toUpperCase()})...`, 'dim');
@@ -179,8 +220,8 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
     log(job, 'workflow disparado. à espera que o GitHub Actions comece a correr...', 'ok');
 
     let runId = null;
-    for (let attempts = 0; attempts < 15 && !runId; attempts++) {
-      await sleep(3000);
+    for (let attempts = 0; attempts < 20 && !runId; attempts++) {
+      await sleep(2000);
       const runsRes = await ghApi(`/repos/${owner}/${repoName}/actions/workflows/build-apk.yml/runs?per_page=1`, {}, token);
       const runsJson = await runsRes.json().catch(() => ({}));
       if (runsJson.workflow_runs && runsJson.workflow_runs.length) runId = runsJson.workflow_runs[0].id;
@@ -196,7 +237,7 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
     let conclusion = null;
     let runUrl = null;
     while (status !== 'completed') {
-      await sleep(6000);
+      await sleep(4000);
       const runRes = await ghApi(`/repos/${owner}/${repoName}/actions/runs/${runId}`, {}, token);
       const runJson = await runRes.json().catch(() => ({}));
       status = runJson.status;
