@@ -1,0 +1,215 @@
+// apk-build-routes.js
+//
+// Router Express para o "apk-builder": faz TODO o diálogo com a API do GitHub
+// (verificar repo, enviar ficheiros, disparar workflow, seguir o build, encontrar
+// a release) do lado do servidor. O telemóvel só faz 1 pedido para iniciar e
+// pedidos leves de status a cada poucos segundos — nada de sequências longas
+// de fetch sobre ligação móvel fraca.
+//
+// Como integrar no teu backend Express existente (o mesmo do MEDBI Store):
+//
+//   const apkBuildRoutes = require('./apk-build-routes');
+//   app.use('/api/apk-build', apkBuildRoutes);
+//
+// Precisa de Node 18+ (fetch global). Não precisa de nenhuma dependência nova.
+
+const express = require('express');
+const router = express.Router();
+
+// ---------- Estado dos jobs (em memória) ----------
+// Suficiente para builds pontuais disparados manualmente. Se o servidor
+// reiniciar a meio de um build, o job perde-se — o utilizador só tem de
+// tentar de novo. Não persiste em BD de propósito (simplicidade).
+const jobs = new Map();
+const JOB_TTL_MS = 30 * 60 * 1000; // limpa jobs com mais de 30 min
+
+function newJob() {
+  const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const job = {
+    id,
+    status: 'running', // running | done | error
+    log: [],
+    downloadUrl: null,
+    createdAt: Date.now(),
+  };
+  jobs.set(id, job);
+  return job;
+}
+
+function log(job, msg, level) {
+  job.log.push({ msg, level: level || 'dim', t: Date.now() });
+}
+
+function cleanupOldJobs() {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if (now - job.createdAt > JOB_TTL_MS) jobs.delete(id);
+  }
+}
+setInterval(cleanupOldJobs, 5 * 60 * 1000).unref();
+
+// ---------- Helper: chamada à API do GitHub (servidor → GitHub, ligação estável) ----------
+async function ghApi(path, opts, token) {
+  const res = await fetch('https://api.github.com' + path, {
+    ...opts,
+    headers: {
+      Authorization: 'Bearer ' + token,
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      ...(opts && opts.headers ? opts.headers : {}),
+    },
+  });
+  return res;
+}
+
+async function uploadFileToRepo(owner, repoName, token, path, base64content, commitMessage) {
+  let sha;
+  const existing = await ghApi(`/repos/${owner}/${repoName}/contents/${path}`, {}, token);
+  if (existing.ok) {
+    const j = await existing.json();
+    sha = j.sha;
+  }
+  return ghApi(
+    `/repos/${owner}/${repoName}/contents/${path}`,
+    { method: 'PUT', body: JSON.stringify({ message: commitMessage, content: base64content, sha }) },
+    token
+  );
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ---------- O fluxo todo, a correr em background no servidor ----------
+async function runBuild(job, { owner, repoName, token, appName, packageId, files, iconBase64 }) {
+  try {
+    log(job, 'a verificar acesso ao repositório...', 'dim');
+    const check = await ghApi(`/repos/${owner}/${repoName}`, {}, token);
+    if (!check.ok) {
+      log(job, `não consegui aceder a ${owner}/${repoName} — verifica o token e o nome do repositório.`, 'err');
+      job.status = 'error';
+      return;
+    }
+    log(job, 'repositório encontrado.', 'ok');
+
+    log(job, `a enviar ${files.length} ficheiro(s) para www/...`, 'dim');
+    for (const f of files) {
+      const put = await uploadFileToRepo(owner, repoName, token, f.path, f.base64, 'build: atualizar ' + f.path + ' via apk-builder');
+      if (!put.ok) {
+        const err = await put.json().catch(() => ({}));
+        log(job, `falha ao enviar ${f.path}: ${err.message || put.status}`, 'err');
+        job.status = 'error';
+        return;
+      }
+      log(job, `✓ ${f.path}`, 'dim');
+    }
+    log(job, 'todos os ficheiros enviados.', 'ok');
+
+    if (iconBase64) {
+      log(job, 'a enviar ícone...', 'dim');
+      const iconPut = await uploadFileToRepo(owner, repoName, token, 'resources/icon.png', iconBase64, 'build: atualizar ícone via apk-builder');
+      if (!iconPut.ok) {
+        const err = await iconPut.json().catch(() => ({}));
+        log(job, `falha ao enviar ícone: ${err.message || iconPut.status}`, 'err');
+        job.status = 'error';
+        return;
+      }
+      log(job, 'ícone enviado.', 'ok');
+    }
+
+    log(job, 'a disparar workflow build-apk.yml...', 'dim');
+    const dispatch = await ghApi(
+      `/repos/${owner}/${repoName}/actions/workflows/build-apk.yml/dispatches`,
+      { method: 'POST', body: JSON.stringify({ ref: 'main', inputs: { app_name: appName, package_id: packageId, source_mode: 'file', source_url: '' } }) },
+      token
+    );
+    if (dispatch.status !== 204) {
+      const err = await dispatch.json().catch(() => ({}));
+      log(job, `não consegui disparar o workflow: ${err.message || dispatch.status}`, 'err');
+      log(job, 'confirma que .github/workflows/build-apk.yml existe no branch "main".', 'warn');
+      job.status = 'error';
+      return;
+    }
+    log(job, 'workflow disparado. à espera que o GitHub Actions comece a correr...', 'ok');
+
+    let runId = null;
+    for (let attempts = 0; attempts < 15 && !runId; attempts++) {
+      await sleep(3000);
+      const runsRes = await ghApi(`/repos/${owner}/${repoName}/actions/workflows/build-apk.yml/runs?per_page=1`, {}, token);
+      const runsJson = await runsRes.json().catch(() => ({}));
+      if (runsJson.workflow_runs && runsJson.workflow_runs.length) runId = runsJson.workflow_runs[0].id;
+    }
+    if (!runId) {
+      log(job, 'não encontrei o run. Verifica manualmente no separador Actions do repositório.', 'err');
+      job.status = 'error';
+      return;
+    }
+    log(job, `run encontrado (#${runId}). A acompanhar progresso...`, 'ok');
+
+    let status = 'queued';
+    let conclusion = null;
+    let runUrl = null;
+    while (status !== 'completed') {
+      await sleep(6000);
+      const runRes = await ghApi(`/repos/${owner}/${repoName}/actions/runs/${runId}`, {}, token);
+      const runJson = await runRes.json().catch(() => ({}));
+      status = runJson.status;
+      conclusion = runJson.conclusion;
+      runUrl = runJson.html_url;
+      log(job, `estado: ${status}`, 'dim');
+    }
+    if (conclusion !== 'success') {
+      log(job, `build falhou (conclusão: ${conclusion}).`, 'err');
+      if (runUrl) log(job, `vê os logs completos em: ${runUrl}`, 'warn');
+      job.status = 'error';
+      return;
+    }
+    log(job, 'build concluído com sucesso!', 'ok');
+
+    log(job, 'a procurar a release com o APK...', 'dim');
+    const releasesRes = await ghApi(`/repos/${owner}/${repoName}/releases?per_page=1&_=${Date.now()}`, {}, token);
+    const releasesJson = await releasesRes.json().catch(() => ([]));
+    const apkAsset = releasesJson[0] && releasesJson[0].assets && releasesJson[0].assets.find((a) => a.name.endsWith('.apk'));
+    if (apkAsset) {
+      log(job, `APK disponível: ${apkAsset.name}`, 'ok');
+      job.downloadUrl = apkAsset.browser_download_url;
+      job.status = 'done';
+    } else {
+      log(job, 'release encontrada mas sem ficheiro .apk anexado. Confirma no separador Releases do repositório.', 'warn');
+      job.status = 'error';
+    }
+  } catch (e) {
+    log(job, 'erro inesperado no servidor: ' + (e && e.message ? e.message : String(e)), 'err');
+    job.status = 'error';
+  }
+}
+
+// ---------- Rotas ----------
+
+// POST /api/apk-build/start
+// body: { repo: "owner/repo", token, appName, packageId, files: [{path, base64}], iconBase64? }
+router.post('/start', express.json({ limit: '25mb' }), (req, res) => {
+  const { repo, token, appName, packageId, files, iconBase64 } = req.body || {};
+  if (!repo || !token || !appName || !packageId || !Array.isArray(files) || !files.length) {
+    return res.status(400).json({ error: 'faltam campos: repo, token, appName, packageId ou files.' });
+  }
+  const [owner, repoName] = String(repo).trim().split('/');
+  if (!owner || !repoName) {
+    return res.status(400).json({ error: 'formato do repositório inválido — tem de ser owner/repo.' });
+  }
+
+  const job = newJob();
+  res.json({ jobId: job.id });
+
+  // corre em background — a resposta HTTP já foi enviada
+  runBuild(job, { owner, repoName, token, appName, packageId, files, iconBase64 });
+});
+
+// GET /api/apk-build/:id
+router.get('/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'job não encontrado (pode ter expirado).' });
+  res.json({ status: job.status, log: job.log, downloadUrl: job.downloadUrl });
+});
+
+module.exports = router;
