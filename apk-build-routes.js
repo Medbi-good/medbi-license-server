@@ -12,9 +12,22 @@
 //   app.use('/api/apk-build', apkBuildRoutes);
 //
 // Precisa de Node 18+ (fetch global). Não precisa de nenhuma dependência nova.
+//
+// TOKEN DO GITHUB — configuração obrigatória:
+// O Personal Access Token deixou de vir do browser (não é seguro pedir ao
+// utilizador para o escrever a cada build). Define-o como variável de
+// ambiente no servidor (no Render: Settings → Environment → Add Environment
+// Variable):
+//
+//   GITHUB_TOKEN = ghp_xxxxxxxxxxxxxxxxxxxx
+//
+// Scopes mínimos necessários no token: "repo" (ou, com fine-grained token,
+// "Contents: write" + "Actions: write" no repositório MEDBI-APK).
 
 const express = require('express');
 const router = express.Router();
+
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
 // ---------- Estado dos jobs (em memória) ----------
 // Suficiente para builds pontuais disparados manualmente. Se o servidor
@@ -221,18 +234,22 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
 // ---------- Rotas ----------
 
 // POST /api/apk-build/start
-// body: { repo: "owner/repo", token, appName, packageId, mode: "url"|"file"|"zip",
+// body: { repo: "owner/repo", appName, packageId, mode: "url"|"file"|"zip",
 //         outputFormat?: "apk"|"aab" (default "apk"),
 //         liveUrl?: "https://...", files: [{path, base64}], iconBase64? }
+// - O token do GitHub já não vem no body — lê-se de process.env.GITHUB_TOKEN.
 // - mode "url": liveUrl obrigatório, files é ignorado (não é preciso embutir nada).
 // - mode "file"/"zip": files obrigatório (o front-end já resolveu ambos para a mesma forma).
 router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
-  const { repo, token, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat } = req.body || {};
+  const { repo, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat } = req.body || {};
   const effectiveMode = mode === 'url' ? 'url' : 'file';
   const effectiveFormat = outputFormat === 'aab' ? 'aab' : 'apk';
 
-  if (!repo || !token || !appName || !packageId) {
-    return res.status(400).json({ error: 'faltam campos: repo, token, appName ou packageId.' });
+  if (!GITHUB_TOKEN) {
+    return res.status(500).json({ error: 'servidor sem GITHUB_TOKEN configurado — define esta variável de ambiente no Render antes de usar o apk-builder.' });
+  }
+  if (!repo || !appName || !packageId) {
+    return res.status(400).json({ error: 'faltam campos: repo, appName ou packageId.' });
   }
   if (effectiveMode === 'url') {
     if (!liveUrl || typeof liveUrl !== 'string') {
@@ -252,7 +269,7 @@ router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
   res.json({ jobId: job.id });
 
   // corre em background — a resposta HTTP já foi enviada
-  runBuild(job, { owner, repoName, token, appName, packageId, mode: effectiveMode, liveUrl, files: files || [], iconBase64, outputFormat: effectiveFormat });
+  runBuild(job, { owner, repoName, token: GITHUB_TOKEN, appName, packageId, mode: effectiveMode, liveUrl, files: files || [], iconBase64, outputFormat: effectiveFormat });
 });
 
 // GET /api/apk-build/:id
