@@ -90,7 +90,12 @@ async function getBranchHeadCommit(owner, repoName, token, branch) {
 // Os blobs são criados em paralelo — isto é o que mais reduz o tempo de
 // build quando há várias dezenas de ficheiros (ex: modo ZIP), porque troca
 // N pedidos sequenciais por um pequeno número de pedidos, a maioria em paralelo.
-async function commitFilesToRepo(owner, repoName, token, branch, files, commitMessage) {
+// Também limpa, no mesmo commit, quaisquer ficheiros dentro de www/ que já
+// não fazem parte deste envio (ex: mudaste de ZIP com várias páginas para
+// um único ficheiro HTML) — evita lixo a acumular-se no repositório.
+// Nota: o ícone (resources/icon.png) não é tocado por esta limpeza — só é
+// substituído se um novo ícone for enviado, o que já é o comportamento desejado.
+async function commitFilesToRepo(owner, repoName, token, branch, files, commitMessage, job) {
   const headSha = await getBranchHeadCommit(owner, repoName, token, branch);
 
   const baseCommitRes = await ghApi(`/repos/${owner}/${repoName}/git/commits/${headSha}`, {}, token);
@@ -98,7 +103,19 @@ async function commitFilesToRepo(owner, repoName, token, branch, files, commitMe
   const baseCommitJson = await baseCommitRes.json();
   const baseTreeSha = baseCommitJson.tree.sha;
 
-  const treeEntries = await Promise.all(files.map(async (f) => {
+  const existingTreeRes = await ghApi(`/repos/${owner}/${repoName}/git/trees/${baseTreeSha}?recursive=1`, {}, token);
+  const existingTreeJson = existingTreeRes.ok ? await existingTreeRes.json().catch(() => ({ tree: [] })) : { tree: [] };
+  const existingWwwPaths = (existingTreeJson.tree || [])
+    .filter((e) => e.type === 'blob' && e.path.startsWith('www/'))
+    .map((e) => e.path);
+
+  const newWwwPaths = new Set(files.filter((f) => f.path.startsWith('www/')).map((f) => f.path));
+  const stalePaths = existingWwwPaths.filter((p) => !newWwwPaths.has(p));
+  if (stalePaths.length && job) {
+    log(job, `a remover ${stalePaths.length} ficheiro(s) antigo(s) de www/ que já não fazem parte deste build...`, 'dim');
+  }
+
+  const treeEntries = await mapWithConcurrency(files, 10, async (f) => {
     const blobRes = await ghApi(
       `/repos/${owner}/${repoName}/git/blobs`,
       { method: 'POST', body: JSON.stringify({ content: f.base64, encoding: 'base64' }) },
@@ -110,7 +127,12 @@ async function commitFilesToRepo(owner, repoName, token, branch, files, commitMe
     }
     const blobJson = await blobRes.json();
     return { path: f.path, mode: '100644', type: 'blob', sha: blobJson.sha };
-  }));
+  });
+
+  // sha: null remove a entrada da árvore — é assim que a Git Trees API apaga ficheiros.
+  for (const stalePath of stalePaths) {
+    treeEntries.push({ path: stalePath, mode: '100644', type: 'blob', sha: null });
+  }
 
   const treeRes = await ghApi(
     `/repos/${owner}/${repoName}/git/trees`,
@@ -150,6 +172,22 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Corre fn sobre items com um máximo de `limit` chamadas em simultâneo — evita
+// disparar centenas de pedidos paralelos à API do GitHub (que pode acionar o
+// "secondary rate limit" / abuse detection em ZIPs com muitos ficheiros).
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 // ---------- O fluxo todo, a correr em background no servidor ----------
 async function runBuild(job, { owner, repoName, token, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat }) {
   try {
@@ -160,7 +198,9 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
       job.status = 'error';
       return;
     }
-    log(job, 'repositório encontrado.', 'ok');
+    const repoJson = await check.json().catch(() => ({}));
+    const branch = repoJson.default_branch || 'main';
+    log(job, `repositório encontrado (branch: ${branch}).`, 'ok');
 
     const filesToCommit = [];
     if (mode === 'url') {
@@ -182,8 +222,8 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
     log(job, `a enviar ${filesToCommit.length} ficheiro(s) num único commit...`, 'dim');
     try {
       const commitSha = await commitFilesToRepo(
-        owner, repoName, token, 'main', filesToCommit,
-        'build: atualizar conteúdo via apk-builder'
+        owner, repoName, token, branch, filesToCommit,
+        'build: atualizar conteúdo via apk-builder', job
       );
       log(job, `✓ commit único enviado (${commitSha.slice(0, 7)}).`, 'ok');
     } catch (e) {
@@ -198,7 +238,7 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
       {
         method: 'POST',
         body: JSON.stringify({
-          ref: 'main',
+          ref: branch,
           inputs: {
             app_name: appName,
             package_id: packageId,
@@ -213,7 +253,7 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
     if (dispatch.status !== 204) {
       const err = await dispatch.json().catch(() => ({}));
       log(job, `não consegui disparar o workflow: ${err.message || dispatch.status}`, 'err');
-      log(job, 'confirma que .github/workflows/build-apk.yml existe no branch "main".', 'warn');
+      log(job, `confirma que .github/workflows/build-apk.yml existe no branch "${branch}".`, 'warn');
       job.status = 'error';
       return;
     }
