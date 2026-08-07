@@ -81,7 +81,7 @@ function sleep(ms) {
 }
 
 // ---------- O fluxo todo, a correr em background no servidor ----------
-async function runBuild(job, { owner, repoName, token, appName, packageId, mode, liveUrl, files, iconBase64 }) {
+async function runBuild(job, { owner, repoName, token, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat }) {
   try {
     log(job, 'a verificar acesso ao repositório...', 'dim');
     const check = await ghApi(`/repos/${owner}/${repoName}`, {}, token);
@@ -138,7 +138,7 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
       log(job, 'ícone enviado.', 'ok');
     }
 
-    log(job, 'a disparar workflow build-apk.yml...', 'dim');
+    log(job, `a disparar workflow build-apk.yml (formato: ${outputFormat.toUpperCase()})...`, 'dim');
     const dispatch = await ghApi(
       `/repos/${owner}/${repoName}/actions/workflows/build-apk.yml/dispatches`,
       {
@@ -150,6 +150,7 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
             package_id: packageId,
             source_mode: mode === 'url' ? 'url' : 'file',
             source_url: mode === 'url' ? liveUrl : '',
+            output_format: outputFormat,
           },
         }),
       },
@@ -198,16 +199,17 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
     }
     log(job, 'build concluído com sucesso!', 'ok');
 
-    log(job, 'a procurar a release com o APK...', 'dim');
+    log(job, `a procurar a release com o ${outputFormat.toUpperCase()}...`, 'dim');
     const releasesRes = await ghApi(`/repos/${owner}/${repoName}/releases?per_page=1&_=${Date.now()}`, {}, token);
     const releasesJson = await releasesRes.json().catch(() => ([]));
-    const apkAsset = releasesJson[0] && releasesJson[0].assets && releasesJson[0].assets.find((a) => a.name.endsWith('.apk'));
-    if (apkAsset) {
-      log(job, `APK disponível: ${apkAsset.name}`, 'ok');
-      job.downloadUrl = apkAsset.browser_download_url;
+    const ext = '.' + outputFormat;
+    const asset = releasesJson[0] && releasesJson[0].assets && releasesJson[0].assets.find((a) => a.name.endsWith(ext));
+    if (asset) {
+      log(job, `${outputFormat.toUpperCase()} disponível: ${asset.name}`, 'ok');
+      job.downloadUrl = asset.browser_download_url;
       job.status = 'done';
     } else {
-      log(job, 'release encontrada mas sem ficheiro .apk anexado. Confirma no separador Releases do repositório.', 'warn');
+      log(job, `release encontrada mas sem ficheiro ${ext} anexado. Confirma no separador Releases do repositório.`, 'warn');
       job.status = 'error';
     }
   } catch (e) {
@@ -220,12 +222,14 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
 
 // POST /api/apk-build/start
 // body: { repo: "owner/repo", token, appName, packageId, mode: "url"|"file"|"zip",
+//         outputFormat?: "apk"|"aab" (default "apk"),
 //         liveUrl?: "https://...", files: [{path, base64}], iconBase64? }
 // - mode "url": liveUrl obrigatório, files é ignorado (não é preciso embutir nada).
 // - mode "file"/"zip": files obrigatório (o front-end já resolveu ambos para a mesma forma).
 router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
-  const { repo, token, appName, packageId, mode, liveUrl, files, iconBase64 } = req.body || {};
+  const { repo, token, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat } = req.body || {};
   const effectiveMode = mode === 'url' ? 'url' : 'file';
+  const effectiveFormat = outputFormat === 'aab' ? 'aab' : 'apk';
 
   if (!repo || !token || !appName || !packageId) {
     return res.status(400).json({ error: 'faltam campos: repo, token, appName ou packageId.' });
@@ -244,17 +248,18 @@ router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
   }
 
   const job = newJob();
+  job.outputFormat = effectiveFormat;
   res.json({ jobId: job.id });
 
   // corre em background — a resposta HTTP já foi enviada
-  runBuild(job, { owner, repoName, token, appName, packageId, mode: effectiveMode, liveUrl, files: files || [], iconBase64 });
+  runBuild(job, { owner, repoName, token, appName, packageId, mode: effectiveMode, liveUrl, files: files || [], iconBase64, outputFormat: effectiveFormat });
 });
 
 // GET /api/apk-build/:id
 router.get('/:id', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'job não encontrado (pode ter expirado).' });
-  res.json({ status: job.status, log: job.log, downloadUrl: job.downloadUrl });
+  res.json({ status: job.status, log: job.log, downloadUrl: job.downloadUrl, outputFormat: job.outputFormat });
 });
 
 module.exports = router;
