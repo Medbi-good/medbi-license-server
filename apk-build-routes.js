@@ -81,7 +81,7 @@ function sleep(ms) {
 }
 
 // ---------- O fluxo todo, a correr em background no servidor ----------
-async function runBuild(job, { owner, repoName, token, appName, packageId, files, iconBase64 }) {
+async function runBuild(job, { owner, repoName, token, appName, packageId, mode, liveUrl, files, iconBase64 }) {
   try {
     log(job, 'a verificar acesso ao repositório...', 'dim');
     const check = await ghApi(`/repos/${owner}/${repoName}`, {}, token);
@@ -92,18 +92,39 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, files
     }
     log(job, 'repositório encontrado.', 'ok');
 
-    log(job, `a enviar ${files.length} ficheiro(s) para www/...`, 'dim');
-    for (const f of files) {
-      const put = await uploadFileToRepo(owner, repoName, token, f.path, f.base64, 'build: atualizar ' + f.path + ' via apk-builder');
+    if (mode === 'url') {
+      // Modo "vivo": não embutimos nada. O www/ local fica só com um placeholder
+      // mínimo (o build-apk.yml deve gerar capacitor.config.json com
+      // server.url = liveUrl, apontando o WebView direto para o site publicado —
+      // sem isto o Capacitor falha por não encontrar pasta www/).
+      log(job, `modo URL — a app vai apontar para ${liveUrl}, sem embutir ficheiros.`, 'dim');
+      const placeholder = '<!doctype html><html><body>A carregar…</body></html>';
+      const put = await uploadFileToRepo(
+        owner, repoName, token, 'www/index.html',
+        Buffer.from(placeholder, 'utf8').toString('base64'),
+        'build: placeholder www/ (modo url) via apk-builder'
+      );
       if (!put.ok) {
         const err = await put.json().catch(() => ({}));
-        log(job, `falha ao enviar ${f.path}: ${err.message || put.status}`, 'err');
+        log(job, `falha ao enviar placeholder www/index.html: ${err.message || put.status}`, 'err');
         job.status = 'error';
         return;
       }
-      log(job, `✓ ${f.path}`, 'dim');
+      log(job, '✓ placeholder www/index.html enviado.', 'ok');
+    } else {
+      log(job, `a enviar ${files.length} ficheiro(s) para www/...`, 'dim');
+      for (const f of files) {
+        const put = await uploadFileToRepo(owner, repoName, token, f.path, f.base64, 'build: atualizar ' + f.path + ' via apk-builder');
+        if (!put.ok) {
+          const err = await put.json().catch(() => ({}));
+          log(job, `falha ao enviar ${f.path}: ${err.message || put.status}`, 'err');
+          job.status = 'error';
+          return;
+        }
+        log(job, `✓ ${f.path}`, 'dim');
+      }
+      log(job, 'todos os ficheiros enviados.', 'ok');
     }
-    log(job, 'todos os ficheiros enviados.', 'ok');
 
     if (iconBase64) {
       log(job, 'a enviar ícone...', 'dim');
@@ -120,7 +141,18 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, files
     log(job, 'a disparar workflow build-apk.yml...', 'dim');
     const dispatch = await ghApi(
       `/repos/${owner}/${repoName}/actions/workflows/build-apk.yml/dispatches`,
-      { method: 'POST', body: JSON.stringify({ ref: 'main', inputs: { app_name: appName, package_id: packageId, source_mode: 'file', source_url: '' } }) },
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ref: 'main',
+          inputs: {
+            app_name: appName,
+            package_id: packageId,
+            source_mode: mode === 'url' ? 'url' : 'file',
+            source_url: mode === 'url' ? liveUrl : '',
+          },
+        }),
+      },
       token
     );
     if (dispatch.status !== 204) {
@@ -187,12 +219,25 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, files
 // ---------- Rotas ----------
 
 // POST /api/apk-build/start
-// body: { repo: "owner/repo", token, appName, packageId, files: [{path, base64}], iconBase64? }
+// body: { repo: "owner/repo", token, appName, packageId, mode: "url"|"file"|"zip",
+//         liveUrl?: "https://...", files: [{path, base64}], iconBase64? }
+// - mode "url": liveUrl obrigatório, files é ignorado (não é preciso embutir nada).
+// - mode "file"/"zip": files obrigatório (o front-end já resolveu ambos para a mesma forma).
 router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
-  const { repo, token, appName, packageId, files, iconBase64 } = req.body || {};
-  if (!repo || !token || !appName || !packageId || !Array.isArray(files) || !files.length) {
-    return res.status(400).json({ error: 'faltam campos: repo, token, appName, packageId ou files.' });
+  const { repo, token, appName, packageId, mode, liveUrl, files, iconBase64 } = req.body || {};
+  const effectiveMode = mode === 'url' ? 'url' : 'file';
+
+  if (!repo || !token || !appName || !packageId) {
+    return res.status(400).json({ error: 'faltam campos: repo, token, appName ou packageId.' });
   }
+  if (effectiveMode === 'url') {
+    if (!liveUrl || typeof liveUrl !== 'string') {
+      return res.status(400).json({ error: 'modo url requer liveUrl.' });
+    }
+  } else if (!Array.isArray(files) || !files.length) {
+    return res.status(400).json({ error: 'faltam ficheiros (files) para o modo escolhido.' });
+  }
+
   const [owner, repoName] = String(repo).trim().split('/');
   if (!owner || !repoName) {
     return res.status(400).json({ error: 'formato do repositório inválido — tem de ser owner/repo.' });
@@ -202,7 +247,7 @@ router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
   res.json({ jobId: job.id });
 
   // corre em background — a resposta HTTP já foi enviada
-  runBuild(job, { owner, repoName, token, appName, packageId, files, iconBase64 });
+  runBuild(job, { owner, repoName, token, appName, packageId, mode: effectiveMode, liveUrl, files: files || [], iconBase64 });
 });
 
 // GET /api/apk-build/:id
