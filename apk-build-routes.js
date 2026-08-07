@@ -188,7 +188,7 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, files
 
 // POST /api/apk-build/start
 // body: { repo: "owner/repo", token, appName, packageId, files: [{path, base64}], iconBase64? }
-router.post('/start', express.json({ limit: '25mb' }), (req, res) => {
+router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
   const { repo, token, appName, packageId, files, iconBase64 } = req.body || {};
   if (!repo || !token || !appName || !packageId || !Array.isArray(files) || !files.length) {
     return res.status(400).json({ error: 'faltam campos: repo, token, appName, packageId ou files.' });
