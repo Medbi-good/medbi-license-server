@@ -67,7 +67,9 @@ Identifica quais destes nomes conhecidos aparecem na foto como presentes (podem 
 Responde APENAS com um objeto JSON, sem texto antes ou depois, sem markdown, exatamente neste formato:
 {"presentes": ["nome exatamente igual a um dos nomes conhecidos"], "nao_reconhecidos": ["nomes visíveis na foto que não correspondem a nenhum nome conhecido"]}`;
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${PRESENCAS_GEMINI_API_KEY}`;
+    // gemini-2.0-flash foi desativado pela Google a 1 de junho de 2026.
+    // Substituído por gemini-3.5-flash (o modelo GA recomendado para o substituir).
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${PRESENCAS_GEMINI_API_KEY}`;
     const geminiResp = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -84,22 +86,31 @@ Responde APENAS com um objeto JSON, sem texto antes ou depois, sem markdown, exa
 
     if (!geminiResp.ok) {
       const errTxt = await geminiResp.text();
-      console.error('reconhecer-presencas: Gemini erro:', errTxt);
-      return res.status(502).json({ error: 'Gemini respondeu com erro.' });
+      console.error('reconhecer-presencas: Gemini erro:', geminiResp.status, errTxt);
+      // Devolve o motivo real (status + corpo) ao cliente, em vez de uma mensagem
+      // genérica, para dar para diagnosticar sem precisar de ver os logs do Render.
+      return res.status(502).json({ error: `Gemini respondeu ${geminiResp.status}: ${errTxt.slice(0, 300)}` });
     }
 
     const data = await geminiResp.json();
     const texto = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!texto) {
-      return res.status(502).json({ error: 'Resposta vazia da IA.' });
+      console.error('reconhecer-presencas: resposta sem texto:', JSON.stringify(data).slice(0, 500));
+      return res.status(502).json({ error: 'Resposta vazia da IA (sem candidates[0].content.parts[0].text).' });
     }
     const limpo = texto.replace(/```json|```/g, '').trim();
-    const resultado = JSON.parse(limpo);
+    let resultado;
+    try {
+      resultado = JSON.parse(limpo);
+    } catch (parseErr) {
+      console.error('reconhecer-presencas: JSON inválido da IA:', limpo.slice(0, 500));
+      return res.status(502).json({ error: 'A IA respondeu texto que não é JSON válido: ' + limpo.slice(0, 200) });
+    }
     res.json(resultado);
 
   } catch (err) {
     console.error('reconhecer-presencas error:', err);
-    res.status(500).json({ error: 'server_error' });
+    res.status(500).json({ error: 'server_error: ' + (err && err.message ? err.message : String(err)) });
   }
 });
 
