@@ -43,6 +43,66 @@ app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'medbi-license-server' });
 });
 
+// ---- Presenças AAFM: reconhecimento de presença por foto (Gemini) ----
+// Nome de variável próprio (PRESENCAS_GEMINI_API_KEY) para não colidir com
+// nada que as outras apps deste mesmo servidor já usem.
+const PRESENCAS_GEMINI_API_KEY = process.env.PRESENCAS_GEMINI_API_KEY;
+
+app.post('/api/reconhecer-presencas', async (req, res) => {
+  try {
+    if (!PRESENCAS_GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'PRESENCAS_GEMINI_API_KEY não configurada no servidor.' });
+    }
+    const { image_base64, media_type, nomes } = req.body || {};
+    if (!image_base64 || !media_type || !Array.isArray(nomes)) {
+      return res.status(400).json({ error: 'Faltam campos: image_base64, media_type ou nomes.' });
+    }
+
+    const prompt = `Esta é uma foto de uma lista de presença (manuscrita ou impressa) de uma reunião/atividade estudantil.
+
+Nomes conhecidos que podem aparecer nesta lista: ${JSON.stringify(nomes)}
+
+Identifica quais destes nomes conhecidos aparecem na foto como presentes (podem estar escritos à mão, com letra difícil, abreviados, com pequenos erros ortográficos, ou fora de ordem). Considera presente qualquer nome da lista que apareça escrito/assinado na foto, exceto se estiver claramente riscado ou marcado como ausente/falta.
+
+Responde APENAS com um objeto JSON, sem texto antes ou depois, sem markdown, exatamente neste formato:
+{"presentes": ["nome exatamente igual a um dos nomes conhecidos"], "nao_reconhecidos": ["nomes visíveis na foto que não correspondem a nenhum nome conhecido"]}`;
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${PRESENCAS_GEMINI_API_KEY}`;
+    const geminiResp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { inline_data: { mime_type: media_type, data: image_base64 } },
+            { text: prompt }
+          ]
+        }],
+        generationConfig: { responseMimeType: 'application/json' }
+      })
+    });
+
+    if (!geminiResp.ok) {
+      const errTxt = await geminiResp.text();
+      console.error('reconhecer-presencas: Gemini erro:', errTxt);
+      return res.status(502).json({ error: 'Gemini respondeu com erro.' });
+    }
+
+    const data = await geminiResp.json();
+    const texto = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!texto) {
+      return res.status(502).json({ error: 'Resposta vazia da IA.' });
+    }
+    const limpo = texto.replace(/```json|```/g, '').trim();
+    const resultado = JSON.parse(limpo);
+    res.json(resultado);
+
+  } catch (err) {
+    console.error('reconhecer-presencas error:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 // Catálogo de apps para MEDBI Store
 app.get('/api/store/apps', async (_req, res) => {
   try {
