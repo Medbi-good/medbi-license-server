@@ -23,11 +23,47 @@
 //
 // Scopes mínimos necessários no token: "repo" (ou, com fine-grained token,
 // "Contents: write" + "Actions: write" no repositório MEDBI-APK).
+//
+// CHAVE DE ACESSO AO PRÓPRIO ENDPOINT — configuração obrigatória:
+// Sem isto, qualquer pessoa que descubra o URL deste backend no Render
+// consegue disparar builds em teu nome (o GITHUB_TOKEN vive no servidor,
+// não no browser, por isso nada o protege sozinho). Define também:
+//
+//   APK_BUILDER_API_KEY = uma-frase-longa-só-tua-que-ninguém-adivinha
+//
+// E no frontend (indexapk.html), escreve essa mesma chave no campo
+// "Chave de acesso" (fica guardada no localStorage do teu telemóvel,
+// não precisas de a escrever a cada build).
 
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const API_KEY = process.env.APK_BUILDER_API_KEY;
+
+// Comparação em tempo constante — evita que um atacante consiga adivinhar a
+// chave carácter a carácter medindo quanto tempo demora cada tentativa.
+function isValidApiKey(provided) {
+  if (!API_KEY || typeof provided !== 'string' || !provided) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(API_KEY);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+// Middleware: exige o header x-api-key em todas as rotas deste router.
+function requireApiKey(req, res, next) {
+  if (!API_KEY) {
+    return res.status(500).json({ error: 'servidor sem APK_BUILDER_API_KEY configurado — define esta variável de ambiente no Render antes de usar o apk-builder.' });
+  }
+  const provided = req.get('x-api-key');
+  if (!isValidApiKey(provided)) {
+    return res.status(401).json({ error: 'chave de acesso em falta ou inválida.' });
+  }
+  next();
+}
+router.use(requireApiKey);
 
 // ---------- Estado dos jobs (em memória) ----------
 // Suficiente para builds pontuais disparados manualmente. Se o servidor
@@ -93,9 +129,11 @@ async function getBranchHeadCommit(owner, repoName, token, branch) {
 // Também limpa, no mesmo commit, quaisquer ficheiros dentro de www/ que já
 // não fazem parte deste envio (ex: mudaste de ZIP com várias páginas para
 // um único ficheiro HTML) — evita lixo a acumular-se no repositório.
-// Nota: o ícone (resources/icon.png) não é tocado por esta limpeza — só é
-// substituído se um novo ícone for enviado, o que já é o comportamento desejado.
-async function commitFilesToRepo(owner, repoName, token, branch, files, commitMessage, job) {
+// extraDeletePaths: caminhos fora de www/ a apagar explicitamente neste
+// commit (ex: 'resources/icon.png' quando o utilizador remove o ícone) —
+// sem isto, o ficheiro antigo ficava esquecido no repo e continuava a ser
+// usado nos builds seguintes mesmo depois de "removido" no formulário.
+async function commitFilesToRepo(owner, repoName, token, branch, files, commitMessage, job, extraDeletePaths) {
   const headSha = await getBranchHeadCommit(owner, repoName, token, branch);
 
   const baseCommitRes = await ghApi(`/repos/${owner}/${repoName}/git/commits/${headSha}`, {}, token);
@@ -108,11 +146,22 @@ async function commitFilesToRepo(owner, repoName, token, branch, files, commitMe
   const existingWwwPaths = (existingTreeJson.tree || [])
     .filter((e) => e.type === 'blob' && e.path.startsWith('www/'))
     .map((e) => e.path);
+  const existingAllPaths = new Set((existingTreeJson.tree || []).filter((e) => e.type === 'blob').map((e) => e.path));
 
   const newWwwPaths = new Set(files.filter((f) => f.path.startsWith('www/')).map((f) => f.path));
   const stalePaths = existingWwwPaths.filter((p) => !newWwwPaths.has(p));
   if (stalePaths.length && job) {
     log(job, `a remover ${stalePaths.length} ficheiro(s) antigo(s) de www/ que já não fazem parte deste build...`, 'dim');
+  }
+
+  // Só apagamos os extras que de facto existem no repo (e que este envio não
+  // está já a substituir por um ficheiro novo com o mesmo caminho).
+  const newPathsThisCommit = new Set(files.map((f) => f.path));
+  const confirmedDeletePaths = (extraDeletePaths || []).filter(
+    (p) => existingAllPaths.has(p) && !newPathsThisCommit.has(p)
+  );
+  if (confirmedDeletePaths.length && job) {
+    log(job, `a remover: ${confirmedDeletePaths.join(', ')}...`, 'dim');
   }
 
   const treeEntries = await mapWithConcurrency(files, 10, async (f) => {
@@ -132,6 +181,9 @@ async function commitFilesToRepo(owner, repoName, token, branch, files, commitMe
   // sha: null remove a entrada da árvore — é assim que a Git Trees API apaga ficheiros.
   for (const stalePath of stalePaths) {
     treeEntries.push({ path: stalePath, mode: '100644', type: 'blob', sha: null });
+  }
+  for (const deletePath of confirmedDeletePaths) {
+    treeEntries.push({ path: deletePath, mode: '100644', type: 'blob', sha: null });
   }
 
   const treeRes = await ghApi(
@@ -198,7 +250,7 @@ function sanitizeHexColor(value) {
 }
 
 // ---------- O fluxo todo, a correr em background no servidor ----------
-async function runBuild(job, { owner, repoName, token, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat, splashColor }) {
+async function runBuild(job, { owner, repoName, token, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat, splashColor, removeIcon }) {
   const safeSplashColor = sanitizeHexColor(splashColor);
   try {
     log(job, 'a verificar acesso ao repositório...', 'dim');
@@ -228,12 +280,19 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
     if (iconBase64) {
       filesToCommit.push({ path: 'resources/icon.png', base64: iconBase64 });
     }
+    // O utilizador pediu explicitamente para voltar ao ícone padrão do
+    // Capacitor — apagamos o ficheiro antigo do repo em vez de o deixar lá
+    // (senão o próximo build continuava a encontrá-lo e a usá-lo).
+    const extraDeletePaths = (removeIcon && !iconBase64) ? ['resources/icon.png'] : [];
+    if (extraDeletePaths.length) {
+      log(job, 'ícone removido pelo utilizador — a apagar resources/icon.png do repositório...', 'dim');
+    }
 
     log(job, `a enviar ${filesToCommit.length} ficheiro(s) num único commit...`, 'dim');
     try {
       const commitSha = await commitFilesToRepo(
         owner, repoName, token, branch, filesToCommit,
-        'build: atualizar conteúdo via apk-builder', job
+        'build: atualizar conteúdo via apk-builder', job, extraDeletePaths
       );
       log(job, `✓ commit único enviado (${commitSha.slice(0, 7)}).`, 'ok');
     } catch (e) {
@@ -243,6 +302,7 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
     }
 
     log(job, `a disparar workflow build-apk.yml (formato: ${outputFormat.toUpperCase()}, splash: ${safeSplashColor})...`, 'dim');
+    const dispatchedAt = Date.now();
     const dispatch = await ghApi(
       `/repos/${owner}/${repoName}/actions/workflows/build-apk.yml/dispatches`,
       {
@@ -270,12 +330,24 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
     }
     log(job, 'workflow disparado. à espera que o GitHub Actions comece a correr...', 'ok');
 
+    // Não basta pegar "o run mais recente" — se houver dois builds a
+    // disparar perto um do outro (ex: retry rápido, ou dois telemóveis a
+    // usar o builder ao mesmo tempo), o mais recente podia ser o run do
+    // OUTRO build. Em vez disso, só aceitamos um run cujo created_at seja
+    // posterior ao instante em que ESTE dispatch foi feito (com uma margem
+    // pequena para relógios ligeiramente dessincronizados entre o nosso
+    // servidor e o GitHub), disparado por workflow_dispatch.
+    const CLOCK_SKEW_MS = 5000;
+    const dispatchThreshold = dispatchedAt - CLOCK_SKEW_MS;
     let runId = null;
     for (let attempts = 0; attempts < 20 && !runId; attempts++) {
       await sleep(2000);
-      const runsRes = await ghApi(`/repos/${owner}/${repoName}/actions/workflows/build-apk.yml/runs?per_page=1`, {}, token);
+      const runsRes = await ghApi(`/repos/${owner}/${repoName}/actions/workflows/build-apk.yml/runs?event=workflow_dispatch&per_page=10`, {}, token);
       const runsJson = await runsRes.json().catch(() => ({}));
-      if (runsJson.workflow_runs && runsJson.workflow_runs.length) runId = runsJson.workflow_runs[0].id;
+      const candidates = (runsJson.workflow_runs || [])
+        .filter((r) => new Date(r.created_at).getTime() >= dispatchThreshold)
+        .sort((a, b) => new Date(a.created_at) - new Date(b.created_at)); // o mais antigo primeiro = o mais próximo do nosso dispatch
+      if (candidates.length) runId = candidates[0].id;
     }
     if (!runId) {
       log(job, 'não encontrei o run. Verifica manualmente no separador Actions do repositório.', 'err');
@@ -329,12 +401,16 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
 // body: { repo: "owner/repo", appName, packageId, mode: "url"|"file"|"zip",
 //         outputFormat?: "apk"|"aab" (default "apk"),
 //         liveUrl?: "https://...", files: [{path, base64}], iconBase64?,
+//         removeIcon?: boolean — true quando o utilizador quer voltar ao ícone
+//         padrão do Capacitor (apaga resources/icon.png do repo); ignorado
+//         se iconBase64 também vier preenchido,
 //         splashColor?: "#RRGGBB" (default "#FDE2DD") — cor de fundo do splash screen }
+// - Requer header x-api-key (ver APK_BUILDER_API_KEY no topo do ficheiro).
 // - O token do GitHub já não vem no body — lê-se de process.env.GITHUB_TOKEN.
 // - mode "url": liveUrl obrigatório, files é ignorado (não é preciso embutir nada).
 // - mode "file"/"zip": files obrigatório (o front-end já resolveu ambos para a mesma forma).
 router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
-  const { repo, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat, splashColor } = req.body || {};
+  const { repo, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat, splashColor, removeIcon } = req.body || {};
   const effectiveMode = mode === 'url' ? 'url' : 'file';
   const effectiveFormat = outputFormat === 'aab' ? 'aab' : 'apk';
 
@@ -362,7 +438,7 @@ router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
   res.json({ jobId: job.id });
 
   // corre em background — a resposta HTTP já foi enviada
-  runBuild(job, { owner, repoName, token: GITHUB_TOKEN, appName, packageId, mode: effectiveMode, liveUrl, files: files || [], iconBase64, outputFormat: effectiveFormat, splashColor });
+  runBuild(job, { owner, repoName, token: GITHUB_TOKEN, appName, packageId, mode: effectiveMode, liveUrl, files: files || [], iconBase64, outputFormat: effectiveFormat, splashColor, removeIcon: !!removeIcon });
 });
 
 // GET /api/apk-build/:id
