@@ -114,6 +114,68 @@ Responde APENAS com um objeto JSON, sem texto antes ou depois, sem markdown, exa
   }
 });
 
+app.post('/api/ler-nome-membro', async (req, res) => {
+  try {
+    if (!PRESENCAS_GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'PRESENCAS_GEMINI_API_KEY não configurada no servidor.' });
+    }
+    const { image_base64, media_type } = req.body || {};
+    if (!image_base64 || !media_type) {
+      return res.status(400).json({ error: 'Faltam campos: image_base64 ou media_type.' });
+    }
+
+    const prompt = `Esta é uma foto de um documento, crachá, cartão ou papel com o nome de uma pessoa (pode ser um nome escrito à mão ou impresso).
+
+Lê e identifica o nome completo da pessoa presente na foto.
+
+Responde APENAS com um objeto JSON, sem texto antes ou depois, sem markdown, exatamente neste formato:
+{"nome": "Nome Completo Lido"}
+
+Se não conseguires ler nenhum nome com confiança, responde: {"nome": ""}`;
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${PRESENCAS_GEMINI_API_KEY}`;
+    const geminiResp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { inline_data: { mime_type: media_type, data: image_base64 } },
+            { text: prompt }
+          ]
+        }],
+        generationConfig: { responseMimeType: 'application/json' }
+      })
+    });
+
+    if (!geminiResp.ok) {
+      const errTxt = await geminiResp.text();
+      console.error('ler-nome-membro: Gemini erro:', geminiResp.status, errTxt);
+      return res.status(502).json({ error: `Gemini respondeu ${geminiResp.status}: ${errTxt.slice(0, 300)}` });
+    }
+
+    const data = await geminiResp.json();
+    const texto = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!texto) {
+      console.error('ler-nome-membro: resposta sem texto:', JSON.stringify(data).slice(0, 500));
+      return res.status(502).json({ error: 'Resposta vazia da IA (sem candidates[0].content.parts[0].text).' });
+    }
+    const limpo = texto.replace(/```json|```/g, '').trim();
+    let resultado;
+    try {
+      resultado = JSON.parse(limpo);
+    } catch (parseErr) {
+      console.error('ler-nome-membro: JSON inválido da IA:', limpo.slice(0, 500));
+      return res.status(502).json({ error: 'A IA respondeu texto que não é JSON válido: ' + limpo.slice(0, 200) });
+    }
+    res.json(resultado);
+
+  } catch (err) {
+    console.error('ler-nome-membro error:', err);
+    res.status(500).json({ error: 'server_error: ' + (err && err.message ? err.message : String(err)) });
+  }
+});
+
 // Catálogo de apps para MEDBI Store
 app.get('/api/store/apps', async (_req, res) => {
   try {
