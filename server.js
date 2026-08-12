@@ -124,14 +124,17 @@ app.post('/api/ler-nome-membro', async (req, res) => {
       return res.status(400).json({ error: 'Faltam campos: image_base64 ou media_type.' });
     }
 
-    const prompt = `Esta é uma foto de um documento, crachá, cartão ou papel com o nome de uma pessoa (pode ser um nome escrito à mão ou impresso).
+    // Lê SEMPRE todos os nomes visíveis na foto (pode ser um único nome num crachá,
+    // ou uma lista/pauta com vários nomes de uma vez). O frontend decide o que fazer
+    // consoante o número de nomes devolvidos.
+    const prompt = `Esta é uma foto de um documento, crachá, cartão, folha de presenças ou pauta com nome(s) de pessoa(s) (pode ser um único nome ou uma lista com vários nomes, escritos à mão ou impressos).
 
-Lê e identifica o nome completo da pessoa presente na foto.
+Lê e identifica TODOS os nomes completos de pessoas presentes na foto, mesmo que sejam muitos (por exemplo, uma lista de turma ou de presenças). Ignora números, datas, cabeçalhos, assinaturas ilegíveis e qualquer texto que não seja claramente um nome de pessoa.
 
 Responde APENAS com um objeto JSON, sem texto antes ou depois, sem markdown, exatamente neste formato:
-{"nome": "Nome Completo Lido"}
+{"nomes": ["Nome Completo 1", "Nome Completo 2"]}
 
-Se não conseguires ler nenhum nome com confiança, responde: {"nome": ""}`;
+Se não conseguires ler nenhum nome com confiança, responde: {"nomes": []}`;
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${PRESENCAS_GEMINI_API_KEY}`;
     const geminiResp = await fetch(url, {
@@ -168,7 +171,17 @@ Se não conseguires ler nenhum nome com confiança, responde: {"nome": ""}`;
       console.error('ler-nome-membro: JSON inválido da IA:', limpo.slice(0, 500));
       return res.status(502).json({ error: 'A IA respondeu texto que não é JSON válido: ' + limpo.slice(0, 200) });
     }
-    res.json(resultado);
+
+    // Normaliza a resposta para {"nomes": [...]}, aceitando também o formato antigo
+    // {"nome": "..."} caso a IA (ou uma versão em cache) ainda o devolva.
+    let nomes = [];
+    if (Array.isArray(resultado.nomes)) {
+      nomes = resultado.nomes.map(n => String(n).trim()).filter(Boolean);
+    } else if (resultado.nome) {
+      nomes = [String(resultado.nome).trim()].filter(Boolean);
+    }
+
+    res.json({ nomes });
 
   } catch (err) {
     console.error('ler-nome-membro error:', err);
