@@ -818,7 +818,8 @@ let ASSISTANT_CHUNKS = [];
 try {
   ASSISTANT_CHUNKS = require('./medbi-mi-chunks.json').map(c => ({
     ...c,
-    _searchText: normalizeForSearch(`${c.diseaseName} ${c.tabLabel} ${c.text}`)
+    _searchWords: new Set(tokenize(`${c.diseaseName} ${c.tabLabel} ${c.text}`)),
+    _diseaseWords: new Set(tokenize(c.diseaseName))
   }));
   console.log(`Assistente MEDBI MI: ${ASSISTANT_CHUNKS.length} pedaços de conteúdo carregados para RAG (pesquisa por palavras-chave).`);
 } catch (e) {
@@ -832,9 +833,12 @@ REGRAS IMPORTANTES:
 - Vais receber, antes da pergunta do estudante, um bloco "CONTEXTO DO MEDBI MI" com trechos reais do conteúdo do app. Usa esse contexto como fonte principal e prioritária da tua resposta sempre que for relevante.
 - Se o contexto fornecido responde à pergunta, baseia-te nele e não contraries os valores/condutas que lá estão.
 - Se o contexto não tiver nada relevante para a pergunta, podes responder com o teu conhecimento médico geral, mas avisa brevemente que essa resposta não vem diretamente do conteúdo do MEDBI MI.
-- Responde apenas sobre temas de Medicina Interna e assuntos clínicos relacionados. Se for completamente fora do âmbito médico/académico, explica educadamente que só podes ajudar com temas de estudo de medicina.
+- Responde apenas sobre temas de Medicina Interna e assuntos clínicos relacionados. Se for completamente fora do âmbito médico/académico (incluindo insultos, desabafos, conversa fiada ou saudações soltas), responde de forma breve e educada, sem inventar conteúdo clínico, e convida a pessoa a fazer uma pergunta de estudo.
+- Nunca inventes listas ou factos clínicos que não estejam ancorados no contexto fornecido ou no teu conhecimento médico geral sólido. Se não tiveres a certeza, diz isso claramente em vez de inventar.
+- Responde sempre no mesmo idioma da pergunta do estudante (português ou espanhol) — não mistures termos em inglês a meio da resposta.
 - Usa português (registo europeu/guineense), claro e direto, adequado a estudantes.
 - Sê didático: usa exemplos clínicos, mnemónicas e estrutura em tópicos quando ajudar a memorização.
+- O conteúdo do MEDBI MI está organizado por: Conceito/Definição, Etiologia/Causas, Quadro Clínico, Exames/Diagnóstico, Complicações e Tratamento. Quando fizer sentido, organiza a tua resposta seguindo esta mesma lógica (causa → clínica → diagnóstico → tratamento).
 - Este assistente é uma ferramenta de ESTUDO, não substitui decisão clínica real nem deve ser usado para diagnosticar doentes reais.
 - Mantém as respostas objetivas — evita textos demasiado longos, o utilizador está normalmente no telemóvel.
 `.trim();
@@ -863,8 +867,9 @@ function tokenize(text) {
 }
 
 // Pesquisa os pedaços de conteúdo mais relevantes para a pergunta,
-// por sobreposição de palavras-chave. Não chama nenhuma API — corre
-// instantaneamente no servidor.
+// por sobreposição de palavras-chave inteiras (não substring, para evitar
+// falsos positivos tipo "serve" a bater dentro de "reserva"). Não chama
+// nenhuma API — corre instantaneamente no servidor.
 function retrieveContext(question) {
   if (!ASSISTANT_CHUNKS.length) return [];
 
@@ -873,19 +878,28 @@ function retrieveContext(question) {
 
   const scored = ASSISTANT_CHUNKS.map(chunk => {
     let score = 0;
-    const diseaseNameNorm = normalizeForSearch(chunk.diseaseName);
+    let matchedWords = 0;
     for (const word of queryWords) {
-      if (chunk._searchText.includes(word)) {
+      if (chunk._searchWords.has(word)) {
+        matchedWords++;
         // Peso maior se a palavra aparece no nome da doença (mais provável
         // de ser o foco real da pergunta do estudante)
-        score += diseaseNameNorm.includes(word) ? 3 : 1;
+        score += chunk._diseaseWords.has(word) ? 3 : 1;
       }
     }
-    return { chunk, score };
+    return { chunk, score, matchedWords };
   });
 
   scored.sort((a, b) => b.score - a.score);
-  return scored.filter(s => s.score > 0).slice(0, ASSISTANT_TOP_K).map(s => s.chunk);
+
+  // Limiar mínimo: exige pelo menos 2 pontos de relevância (ex: uma palavra
+  // no nome da doença, ou duas palavras diferentes da pergunta encontradas).
+  // Isto evita injetar contexto aleatório em mensagens que não são
+  // perguntas médicas reais (insultos, conversa fiada, saudações soltas).
+  return scored
+    .filter(s => s.score >= 2)
+    .slice(0, ASSISTANT_TOP_K)
+    .map(s => s.chunk);
 }
 
 app.post('/api/assistant/chat', async (req, res) => {
