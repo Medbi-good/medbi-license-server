@@ -385,10 +385,19 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
     log(job, 'build concluído com sucesso!', 'ok');
 
     log(job, `a procurar a release com o ${outputFormat.toUpperCase()}...`, 'dim');
-    const releasesRes = await ghApi(`/repos/${owner}/${repoName}/releases?per_page=1&_=${Date.now()}`, {}, token);
-    const releasesJson = await releasesRes.json().catch(() => ([]));
     const ext = '.' + outputFormat;
-    const asset = releasesJson[0] && releasesJson[0].assets && releasesJson[0].assets.find((a) => a.name.endsWith(ext));
+    // O GitHub por vezes mostra a Release já criada na API antes do ficheiro
+    // anexado (o asset) aparecer nela — o passo "action-gh-release" só marca
+    // como concluído depois do upload, mas a leitura seguinte pode apanhar
+    // um estado ainda não totalmente propagado. Por isso tenta-se algumas
+    // vezes com um pequeno intervalo, em vez de desistir à primeira.
+    let asset = null;
+    for (let attempt = 0; attempt < 6 && !asset; attempt++) {
+      if (attempt > 0) await sleep(3000);
+      const releasesRes = await ghApi(`/repos/${owner}/${repoName}/releases?per_page=1&_=${Date.now()}`, {}, token);
+      const releasesJson = await releasesRes.json().catch(() => ([]));
+      asset = releasesJson[0] && releasesJson[0].assets && releasesJson[0].assets.find((a) => a.name.endsWith(ext));
+    }
     if (asset) {
       log(job, `${outputFormat.toUpperCase()} disponível: ${asset.name}`, 'ok');
       job.downloadUrl = asset.browser_download_url;
