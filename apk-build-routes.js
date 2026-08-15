@@ -250,7 +250,7 @@ function sanitizeHexColor(value) {
 }
 
 // ---------- O fluxo todo, a correr em background no servidor ----------
-async function runBuild(job, { owner, repoName, token, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat, splashColor, removeIcon }) {
+async function runBuild(job, { owner, repoName, token, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat, splashColor, removeIcon, decompiledZipBase64, keepOriginalPackage, forceNewKeystore }) {
   const safeSplashColor = sanitizeHexColor(splashColor);
   try {
     log(job, 'a verificar acesso ao repositório...', 'dim');
@@ -265,7 +265,13 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
     log(job, `repositório encontrado (branch: ${branch}).`, 'ok');
 
     const filesToCommit = [];
-    if (mode === 'url') {
+    if (mode === 'decompiled') {
+      // Projeto já descompilado (apktool d): um único ficheiro binário na
+      // raiz do repo, decompiled.zip — o build-apk.yml extrai-o e reconstrói
+      // com apktool. Não passa por www/ nem por Capacitor.
+      log(job, 'modo decompiled — a enviar decompiled.zip (projeto smali/+res/) para a raiz do repositório...', 'dim');
+      filesToCommit.push({ path: 'decompiled.zip', base64: decompiledZipBase64 });
+    } else if (mode === 'url') {
       // Modo "vivo": não embutimos nada. O www/ local fica só com um placeholder
       // mínimo (o build-apk.yml deve gerar capacitor.config.json com
       // server.url = liveUrl, apontando o WebView direto para o site publicado —
@@ -277,13 +283,13 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
       log(job, `a preparar ${files.length} ficheiro(s) para www/...`, 'dim');
       filesToCommit.push(...files);
     }
-    if (iconBase64) {
+    if (mode !== 'decompiled' && iconBase64) {
       filesToCommit.push({ path: 'resources/icon.png', base64: iconBase64 });
     }
     // O utilizador pediu explicitamente para voltar ao ícone padrão do
     // Capacitor — apagamos o ficheiro antigo do repo em vez de o deixar lá
     // (senão o próximo build continuava a encontrá-lo e a usá-lo).
-    const extraDeletePaths = (removeIcon && !iconBase64) ? ['resources/icon.png'] : [];
+    const extraDeletePaths = (mode !== 'decompiled' && removeIcon && !iconBase64) ? ['resources/icon.png'] : [];
     if (extraDeletePaths.length) {
       log(job, 'ícone removido pelo utilizador — a apagar resources/icon.png do repositório...', 'dim');
     }
@@ -312,10 +318,12 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
           inputs: {
             app_name: appName,
             package_id: packageId,
-            source_mode: mode === 'url' ? 'url' : 'file',
+            source_mode: mode === 'decompiled' ? 'decompiled' : (mode === 'url' ? 'url' : 'file'),
             source_url: mode === 'url' ? liveUrl : '',
             output_format: outputFormat,
             splash_color: safeSplashColor,
+            keep_original_package: keepOriginalPackage === false ? 'nao' : 'sim',
+            force_new_keystore: forceNewKeystore === true ? 'sim' : 'nao',
           },
         }),
       },
@@ -398,20 +406,32 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
 // ---------- Rotas ----------
 
 // POST /api/apk-build/start
-// body: { repo: "owner/repo", appName, packageId, mode: "url"|"file"|"zip",
-//         outputFormat?: "apk"|"aab" (default "apk"),
+// body: { repo: "owner/repo", appName, packageId, mode: "url"|"file"|"zip"|"decompiled",
+//         outputFormat?: "apk"|"aab" (default "apk"; "decompiled" só aceita "apk"),
 //         liveUrl?: "https://...", files: [{path, base64}], iconBase64?,
 //         removeIcon?: boolean — true quando o utilizador quer voltar ao ícone
 //         padrão do Capacitor (apaga resources/icon.png do repo); ignorado
 //         se iconBase64 também vier preenchido,
-//         splashColor?: "#RRGGBB" (default "#FDE2DD") — cor de fundo do splash screen }
+//         splashColor?: "#RRGGBB" (default "#FDE2DD") — cor de fundo do splash screen,
+//         decompiledZipBase64?: string — obrigatório em mode "decompiled": um
+//         .zip (base64) com a estrutura direta de "apktool d" (AndroidManifest.xml,
+//         res/, smali/ na raiz do zip),
+//         keepOriginalPackage?: boolean (default true) — só relevante em mode
+//         "decompiled": false faz o workflow renomear o package (manifesto +
+//         pastas smali/ + referências) para o packageId enviado,
+//         forceNewKeystore?: boolean (default false) — ignora o KEYSTORE_BASE64
+//         fixo, mesmo que exista, e assina com uma keystore gerada só para este build }
 // - Requer header x-api-key (ver APK_BUILDER_API_KEY no topo do ficheiro).
 // - O token do GitHub já não vem no body — lê-se de process.env.GITHUB_TOKEN.
 // - mode "url": liveUrl obrigatório, files é ignorado (não é preciso embutir nada).
 // - mode "file"/"zip": files obrigatório (o front-end já resolveu ambos para a mesma forma).
+// - mode "decompiled": decompiledZipBase64 obrigatório; files/iconBase64/liveUrl ignorados.
 router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
-  const { repo, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat, splashColor, removeIcon } = req.body || {};
-  const effectiveMode = mode === 'url' ? 'url' : 'file';
+  const {
+    repo, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat,
+    splashColor, removeIcon, decompiledZipBase64, keepOriginalPackage, forceNewKeystore,
+  } = req.body || {};
+  const effectiveMode = mode === 'url' ? 'url' : (mode === 'decompiled' ? 'decompiled' : 'file');
   const effectiveFormat = outputFormat === 'aab' ? 'aab' : 'apk';
 
   if (!GITHUB_TOKEN) {
@@ -423,6 +443,13 @@ router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
   if (effectiveMode === 'url') {
     if (!liveUrl || typeof liveUrl !== 'string') {
       return res.status(400).json({ error: 'modo url requer liveUrl.' });
+    }
+  } else if (effectiveMode === 'decompiled') {
+    if (!decompiledZipBase64 || typeof decompiledZipBase64 !== 'string') {
+      return res.status(400).json({ error: 'modo decompiled requer decompiledZipBase64 (zip com a saída direta de "apktool d").' });
+    }
+    if (effectiveFormat === 'aab') {
+      return res.status(400).json({ error: 'modo decompiled só produz APK — o apktool reconstrói um APK, não um App Bundle. Usa outputFormat: "apk".' });
     }
   } else if (!Array.isArray(files) || !files.length) {
     return res.status(400).json({ error: 'faltam ficheiros (files) para o modo escolhido.' });
@@ -438,7 +465,11 @@ router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
   res.json({ jobId: job.id });
 
   // corre em background — a resposta HTTP já foi enviada
-  runBuild(job, { owner, repoName, token: GITHUB_TOKEN, appName, packageId, mode: effectiveMode, liveUrl, files: files || [], iconBase64, outputFormat: effectiveFormat, splashColor, removeIcon: !!removeIcon });
+  runBuild(job, {
+    owner, repoName, token: GITHUB_TOKEN, appName, packageId, mode: effectiveMode, liveUrl,
+    files: files || [], iconBase64, outputFormat: effectiveFormat, splashColor, removeIcon: !!removeIcon,
+    decompiledZipBase64, keepOriginalPackage: keepOriginalPackage !== false, forceNewKeystore: !!forceNewKeystore,
+  });
 });
 
 // GET /api/apk-build/:id
