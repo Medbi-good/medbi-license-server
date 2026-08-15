@@ -161,7 +161,7 @@ function parseTreeTxt(text) {
 }
 
 // ---------- Fluxo principal (corre em background) ----------
-async function runDecompile(job, { owner, repoName, token, branch, apkPath, apkBase64, wantSmali, wantJava, wantResources }) {
+async function runDecompile(job, { owner, repoName, token, branch, apkPath, apkBase64, wantSmali, wantJava, wantResources, appOnly }) {
   try {
     log(job, `a enviar o apk para o repositório (${apkPath})...`, 'dim');
     await commitApkToRepo(owner, repoName, token, branch, apkPath, apkBase64);
@@ -179,6 +179,7 @@ async function runDecompile(job, { owner, repoName, token, branch, apkPath, apkB
           want_smali: String(wantSmali),
           want_java: String(wantJava),
           want_resources: String(wantResources),
+          app_only: String(appOnly),
         },
       }) },
       token
@@ -261,7 +262,7 @@ async function runDecompile(job, { owner, repoName, token, branch, apkPath, apkB
 
 // POST /api/apk-decompile/start
 // body: { repo: "owner/repo", branch?: "main", apkName, apkBase64,
-//         options: { smali: bool, java: bool, resources: bool } }
+//         options: { smali: bool, java: bool, resources: bool, appOnly: bool } }
 router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
   const { repo, branch, apkName, apkBase64, options } = req.body || {};
   if (!GITHUB_TOKEN) {
@@ -286,6 +287,7 @@ router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
     owner, repoName, token: GITHUB_TOKEN, branch: branch || 'main',
     apkPath, apkBase64,
     wantSmali: opts.smali !== false, wantJava: opts.java !== false, wantResources: opts.resources !== false,
+    appOnly: opts.appOnly !== false,
   });
 });
 
