@@ -353,7 +353,7 @@ async function runDecompile(job, { owner, repoName, token, branch, apkPath, apkB
 // POST /api/apk-decompile/start
 // body: { repo: "owner/repo", branch?: "main", apkName, apkBase64,
 //         options: { smali: bool, java: bool, resources: bool, appOnly: bool } }
-router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
+router.post('/start', express.json({ limit: '200mb' }), (req, res) => {
   const { repo, branch, apkName, apkBase64, options } = req.body || {};
   if (!GITHUB_TOKEN) {
     return res.status(500).json({ error: 'servidor sem GITHUB_TOKEN configurado.' });

@@ -6,7 +6,7 @@ const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '100mb' }));
+app.use(express.json({ limit: '200mb' }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
