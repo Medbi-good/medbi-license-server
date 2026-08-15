@@ -31,10 +31,23 @@
 
 const express = require('express');
 const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 const router = express.Router();
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const API_KEY = process.env.APK_UNPACK_API_KEY;
+
+// ---------- Supabase (persistência dos jobs, sobrevive a reinícios do Render) ----------
+// Reutiliza as variáveis já usadas noutros projetos Supabase do Alberto, se existirem;
+// senão cai para as variáveis próprias deste backend.
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+  : null;
+if (!supabase) {
+  console.warn('[apk-decompile] SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY não configuradas — jobs só ficam em memória e não sobrevivem a um restart do Render.');
+}
 
 function isValidApiKey(provided) {
   if (!API_KEY || typeof provided !== 'string' || !provided) return false;
@@ -56,24 +69,101 @@ function requireApiKey(req, res, next) {
 }
 router.use(requireApiKey);
 
-// ---------- Estado dos jobs (em memória, igual ao apk-build) ----------
+// ---------- Estado dos jobs (Map em memória = cache; Supabase = fonte durável) ----------
 const jobs = new Map();
 const JOB_TTL_MS = 30 * 60 * 1000;
+const SUPABASE_TABLE = 'medbi_apk_decompile_jobs';
 
 function newJob() {
   const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
   const job = { id, status: 'running', log: [], downloadUrl: null, tree: null, createdAt: Date.now() };
   jobs.set(id, job);
+  schedulePersist(job);
   return job;
 }
-function log(job, msg, level) { job.log.push({ msg, level: level || 'dim', t: Date.now() }); }
+function log(job, msg, level) {
+  job.log.push({ msg, level: level || 'dim', t: Date.now() });
+  schedulePersist(job);
+}
 function cleanupOldJobs() {
   const now = Date.now();
   for (const [id, job] of jobs) { if (now - job.createdAt > JOB_TTL_MS) jobs.delete(id); }
+  if (supabase) {
+    const cutoff = new Date(now - JOB_TTL_MS).toISOString();
+    supabase.from(SUPABASE_TABLE).delete().lt('created_at', cutoff)
+      .then(({ error }) => { if (error) console.error('[apk-decompile] falha a limpar jobs antigos no supabase:', error.message); });
+  }
 }
 setInterval(cleanupOldJobs, 5 * 60 * 1000).unref();
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// ---------- Persistência: debounce por job para não escrever no supabase a
+// cada linha de log (podem ser dezenas por job) — junta escritas próximas
+// numa só, 300ms depois da última alteração. Mudanças de estado terminais
+// (done/error) são persistidas de imediato, sem debounce, por segurança. ----------
+const persistTimers = new Map();
+
+function toRow(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    log: job.log,
+    download_url: job.downloadUrl,
+    tree: job.tree,
+    created_at: new Date(job.createdAt).toISOString(),
+  };
+}
+
+async function persistJobNow(job) {
+  if (!supabase) return;
+  try {
+    const { error } = await supabase.from(SUPABASE_TABLE).upsert(toRow(job));
+    if (error) console.error('[apk-decompile] falha ao persistir job no supabase:', error.message);
+  } catch (e) {
+    console.error('[apk-decompile] erro inesperado ao persistir job no supabase:', e.message);
+  }
+}
+
+function schedulePersist(job) {
+  if (!supabase) return;
+  if (persistTimers.has(job.id)) clearTimeout(persistTimers.get(job.id));
+  const t = setTimeout(() => { persistTimers.delete(job.id); persistJobNow(job); }, 300);
+  if (typeof t.unref === 'function') t.unref();
+  persistTimers.set(job.id, t);
+}
+
+// Marca o job como concluído/erro e força a escrita imediata (sem debounce),
+// porque é o estado que mais importa não perder num restart.
+function finishJob(job, status) {
+  job.status = status;
+  if (persistTimers.has(job.id)) { clearTimeout(persistTimers.get(job.id)); persistTimers.delete(job.id); }
+  return persistJobNow(job);
+}
+
+// Vai ao supabase buscar um job que já não está na cache em memória
+// (aconteceu um restart do backend a meio do polling). Hidrata a cache
+// para os próximos pedidos não precisarem de ir lá outra vez.
+async function loadJobFromSupabase(id) {
+  if (!supabase) return null;
+  try {
+    const { data, error } = await supabase.from(SUPABASE_TABLE).select('*').eq('id', id).single();
+    if (error || !data) return null;
+    const job = {
+      id: data.id,
+      status: data.status,
+      log: data.log || [],
+      downloadUrl: data.download_url,
+      tree: data.tree,
+      createdAt: new Date(data.created_at).getTime(),
+    };
+    jobs.set(job.id, job);
+    return job;
+  } catch (e) {
+    console.error('[apk-decompile] falha ao carregar job do supabase:', e.message);
+    return null;
+  }
+}
 
 // ---------- Helper: chamada à API do GitHub ----------
 async function ghApi(path, opts, token) {
@@ -188,7 +278,7 @@ async function runDecompile(job, { owner, repoName, token, branch, apkPath, apkB
       const err = await dispatch.json().catch(() => ({}));
       log(job, `não consegui disparar o workflow: ${err.message || dispatch.status}`, 'err');
       log(job, `confirma que .github/workflows/decompile.yml existe no branch "${branch}".`, 'warn');
-      job.status = 'error';
+      await finishJob(job, 'error');
       return;
     }
     log(job, 'workflow disparado. à espera que o GitHub Actions comece a correr...', 'ok');
@@ -207,7 +297,7 @@ async function runDecompile(job, { owner, repoName, token, branch, apkPath, apkB
     }
     if (!runId) {
       log(job, 'não encontrei o run. Verifica manualmente no separador Actions do repositório.', 'err');
-      job.status = 'error';
+      await finishJob(job, 'error');
       return;
     }
     log(job, `run encontrado (#${runId}). A acompanhar progresso...`, 'ok');
@@ -223,7 +313,7 @@ async function runDecompile(job, { owner, repoName, token, branch, apkPath, apkB
     if (conclusion !== 'success') {
       log(job, `desmontagem falhou (conclusão: ${conclusion}).`, 'err');
       if (runUrl) log(job, `vê os logs completos em: ${runUrl}`, 'warn');
-      job.status = 'error';
+      await finishJob(job, 'error');
       return;
     }
     log(job, 'desmontagem concluída com sucesso!', 'ok');
@@ -233,7 +323,7 @@ async function runDecompile(job, { owner, repoName, token, branch, apkPath, apkB
     const relRes = await ghApi(`/repos/${owner}/${repoName}/releases/tags/${tag}`, {}, token);
     if (!relRes.ok) {
       log(job, 'release não encontrada. Confirma no separador Releases do repositório.', 'err');
-      job.status = 'error';
+      await finishJob(job, 'error');
       return;
     }
     const relJson = await relRes.json();
@@ -241,7 +331,7 @@ async function runDecompile(job, { owner, repoName, token, branch, apkPath, apkB
     const treeAsset = (relJson.assets || []).find((a) => a.name === 'tree.txt');
     if (!zipAsset) {
       log(job, 'release encontrada mas sem .zip anexado.', 'warn');
-      job.status = 'error';
+      await finishJob(job, 'error');
       return;
     }
     job.downloadUrl = zipAsset.browser_download_url;
@@ -251,10 +341,10 @@ async function runDecompile(job, { owner, repoName, token, branch, apkPath, apkB
       const treeRes = await fetch(treeAsset.browser_download_url);
       if (treeRes.ok) job.tree = parseTreeTxt(await treeRes.text());
     }
-    job.status = 'done';
+    await finishJob(job, 'done');
   } catch (e) {
     log(job, 'erro inesperado no servidor: ' + (e && e.message ? e.message : String(e)), 'err');
-    job.status = 'error';
+    await finishJob(job, 'error');
   }
 }
 
@@ -292,8 +382,14 @@ router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
 });
 
 // GET /api/apk-decompile/:id
-router.get('/:id', (req, res) => {
-  const job = jobs.get(req.params.id);
+router.get('/:id', async (req, res) => {
+  let job = jobs.get(req.params.id);
+  if (!job) {
+    // não está na cache em memória — pode ter havido um restart do backend
+    // a meio do job (Render hiberna/reinicia). Tenta ir buscar ao supabase
+    // antes de desistir com 404.
+    job = await loadJobFromSupabase(req.params.id);
+  }
   if (!job) return res.status(404).json({ error: 'job não encontrado (pode ter expirado).' });
   res.json({ status: job.status, log: job.log, downloadUrl: job.downloadUrl, tree: job.tree });
 });
