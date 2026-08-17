@@ -801,6 +801,7 @@ app.get('/admin', (_req, res) => {
 
 app.use('/api/apk-build', require('./apk-build-routes'));
 app.use('/api/apk-decompile', require('./apk-decompile-routes'));
+app.use('/api', require('./ranking-routes'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`MEDBI license server escuchando en puerto ${PORT}`));
