@@ -249,9 +249,19 @@ function sanitizeHexColor(value) {
   return DEFAULT_SPLASH_COLOR;
 }
 
+// ---------- Sanitização do URL scheme (deep link) ----------
+// Espelha a limpeza feita no build-apk.yml (só letras/números) — aqui é só
+// para não mandarmos lixo óbvio ao workflow_dispatch; a limpeza "a sério"
+// (que decide o que fica no AndroidManifest.xml) acontece no próprio YAML.
+function sanitizeUrlScheme(value) {
+  if (typeof value !== 'string') return '';
+  return value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 // ---------- O fluxo todo, a correr em background no servidor ----------
-async function runBuild(job, { owner, repoName, token, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat, splashColor, removeIcon, decompiledZipBase64, keepOriginalPackage, forceNewKeystore }) {
+async function runBuild(job, { owner, repoName, token, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat, splashColor, removeIcon, decompiledZipBase64, keepOriginalPackage, forceNewKeystore, urlScheme }) {
   const safeSplashColor = sanitizeHexColor(splashColor);
+  const safeUrlScheme = sanitizeUrlScheme(urlScheme);
   try {
     log(job, 'a verificar acesso ao repositório...', 'dim');
     const check = await ghApi(`/repos/${owner}/${repoName}`, {}, token);
@@ -307,7 +317,7 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
       return;
     }
 
-    log(job, `a disparar workflow build-apk.yml (formato: ${outputFormat.toUpperCase()}, splash: ${safeSplashColor})...`, 'dim');
+    log(job, `a disparar workflow build-apk.yml (formato: ${outputFormat.toUpperCase()}, splash: ${safeSplashColor}${safeUrlScheme ? `, scheme: ${safeUrlScheme}://` : ''})...`, 'dim');
     const dispatchedAt = Date.now();
     const dispatch = await ghApi(
       `/repos/${owner}/${repoName}/actions/workflows/build-apk.yml/dispatches`,
@@ -324,6 +334,7 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
             splash_color: safeSplashColor,
             keep_original_package: keepOriginalPackage === false ? 'nao' : 'sim',
             force_new_keystore: forceNewKeystore === true ? 'sim' : 'nao',
+            url_scheme: safeUrlScheme,
           },
         }),
       },
@@ -429,7 +440,10 @@ async function runBuild(job, { owner, repoName, token, appName, packageId, mode,
 //         "decompiled": false faz o workflow renomear o package (manifesto +
 //         pastas smali/ + referências) para o packageId enviado,
 //         forceNewKeystore?: boolean (default false) — ignora o KEYSTORE_BASE64
-//         fixo, mesmo que exista, e assina com uma keystore gerada só para este build }
+//         fixo, mesmo que exista, e assina com uma keystore gerada só para este build,
+//         urlScheme?: string — deep link scheme (ex: "medbimi"); limpo aqui para
+//         só letras/números minúsculas e passado ao workflow como url_scheme;
+//         vazio/omitido = nenhum intent-filter extra é registado }
 // - Requer header x-api-key (ver APK_BUILDER_API_KEY no topo do ficheiro).
 // - O token do GitHub já não vem no body — lê-se de process.env.GITHUB_TOKEN.
 // - mode "url": liveUrl obrigatório, files é ignorado (não é preciso embutir nada).
@@ -439,6 +453,7 @@ router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
   const {
     repo, appName, packageId, mode, liveUrl, files, iconBase64, outputFormat,
     splashColor, removeIcon, decompiledZipBase64, keepOriginalPackage, forceNewKeystore,
+    urlScheme,
   } = req.body || {};
   const effectiveMode = mode === 'url' ? 'url' : (mode === 'decompiled' ? 'decompiled' : 'file');
   const effectiveFormat = outputFormat === 'aab' ? 'aab' : 'apk';
@@ -478,6 +493,7 @@ router.post('/start', express.json({ limit: '100mb' }), (req, res) => {
     owner, repoName, token: GITHUB_TOKEN, appName, packageId, mode: effectiveMode, liveUrl,
     files: files || [], iconBase64, outputFormat: effectiveFormat, splashColor, removeIcon: !!removeIcon,
     decompiledZipBase64, keepOriginalPackage: keepOriginalPackage !== false, forceNewKeystore: !!forceNewKeystore,
+    urlScheme,
   });
 });
 
