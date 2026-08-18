@@ -193,7 +193,7 @@ Se não conseguires ler nenhum nome com confiança, responde: {"nomes": []}`;
 app.get('/api/store/apps', async (_req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT id, name, description, icon, version, size_mb, apk_url, is_free, free_until, package_name, price_monthly, price_annual FROM apps WHERE published = true ORDER BY name'
+      'SELECT id, name, description, icon, version, size_mb, apk_url, is_free, free_until, package_name, url_scheme, price_monthly, price_annual FROM apps WHERE published = true ORDER BY name'
     );
     res.json({ apps: rows });
   } catch (err) {
